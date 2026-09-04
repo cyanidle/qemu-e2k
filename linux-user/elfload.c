@@ -2050,6 +2050,21 @@ static void elf_core_copy_regs(target_elf_gregset_t *regs, const CPUE2KState *en
     qemu_log_mask(LOG_UNIMP, "elf_core_copy_regs: not implemented\n");
 }
 
+/*
+ * glibc checks AT_FAST_SYSCALLS to decide whether the fast syscall
+ * variants may be used; getcontext has no slow counterpart at all.
+ * Advertise gettimeofday, clock_gettime, getcpu, siggetmask and
+ * getcontext like the kernel does (set_return stays unimplemented).
+ */
+#define E2K_AT_FAST_SYSCALLS    32
+#define E2K_AT_SYSTEM_INFO      34
+#define DLINFO_ARCH_ITEMS       2
+#define ARCH_DLINFO                                     \
+    do {                                                \
+        NEW_AUX_ENT(E2K_AT_FAST_SYSCALLS, 0x1f);        \
+        NEW_AUX_ENT(E2K_AT_SYSTEM_INFO, 0x1);           \
+    } while (0)
+
 #endif /* TARGET_E2K */
 
 #ifndef ELF_BASE_PLATFORM

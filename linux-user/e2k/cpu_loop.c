@@ -124,13 +124,25 @@ void cpu_loop(CPUE2KState *env)
                     num = args[0];
 
                     if (trapnr == E2K_EXCP_SYSCALL_FAST) {
-                        num = e2k_map_fast_syscall(num);
-                        if (num < 0) {
-                            ret = -num;
+                        if (num == TARGET_NR_fast_sys_getcontext ||
+                            num == TARGET_NR_fast_sys_siggetmask) {
+                            if (num == TARGET_NR_fast_sys_getcontext) {
+                                ret = do_fast_getcontext(env, args[1],
+                                                         args[2]);
+                            } else {
+                                ret = do_fast_siggetmask(env, args[1],
+                                                         args[2]);
+                            }
+                            num = -1; /* handled, skip do_syscall below */
+                        } else {
+                            num = e2k_map_fast_syscall(num);
+                            if (num < 0) {
+                                ret = num;
+                            }
                         }
                     }
 
-                    if (ret == 0) {
+                    if (ret == 0 && num >= 0) {
                         if (env->enable_pagecache) {
                             e2k_clear_probe_page_cache(num);
                         }

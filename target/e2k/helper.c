@@ -265,7 +265,13 @@ uint64_t HELPER(prep_return)(CPUE2KState *env, int ipd)
     ret.base = cr0_hi;
     ret.tag = CTPR_TAG_RETURN;
 #ifdef CONFIG_USER_ONLY
-    ret.opc = cr0_hi == E2K_SIGRET_ADDR ? CTPR_OPC_SIGRET : 0;
+    if (cr0_hi == E2K_SIGRET_ADDR) {
+        ret.opc = CTPR_OPC_SIGRET;
+    } else if (cr0_hi == E2K_CTXRET_ADDR) {
+        ret.opc = CTPR_OPC_CTXRET;
+    } else {
+        ret.opc = 0;
+    }
 #else
     // TODO: set ctpr.opc
     ret.opc = 0;
@@ -285,6 +291,31 @@ void HELPER(return)(CPUE2KState *env)
         env->wreg[0].lo = 119; /* TARGET_NR_sigreturn */
         if (env->enable_tags) {
             env->wtag[0] = E2K_TAG_NUMBER64;
+        }
+        cs->exception_index = E2K_EXCP_SYSCALL;
+        cpu_loop_exit(cs);
+    }
+
+    if (opc == CTPR_OPC_CTXRET) {
+        CPUState *cs = env_cpu(env);
+        /*
+         * A makecontext'd coroutine is done: its function returned to the
+         * makecontext trampoline frame, whose chain record points at
+         * E2K_CTXRET_ADDR.  Do not pop anything: the dying context's frames
+         * are abandoned as is.  Inject a setcontext(uc_link, 8) syscall;
+         * uc_link was stored at the base of the procedure stack by
+         * makecontext.
+         */
+        env->wreg[0].lo = 369; /* TARGET_NR_setcontext */
+        env->wreg[1].lo = cpu_ldq_le_data(env,
+            cpu_ldq_le_data(env, env->psp.base));
+        env->wreg[2].lo = 8;
+        if (env->enable_tags) {
+            int i;
+
+            for (i = 0; i < 3; i++) {
+                env->wtag[i] = E2K_TAG_NUMBER64;
+            }
         }
         cs->exception_index = E2K_EXCP_SYSCALL;
         cpu_loop_exit(cs);

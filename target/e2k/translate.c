@@ -6602,6 +6602,7 @@ static void e2k_tr_translate_insn(DisasContextBase *db, CPUState *cs)
         break;
     case E2K_SYSRET_BACKTRACE_ADDR:
     case E2K_SYSRET_ADDR:
+    case E2K_CTXRET_ADDR:
     {
         /* fake return from syscall handler */
         TCGv_i32 t0 = tcg_constant_i32(0);

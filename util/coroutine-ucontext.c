@@ -46,6 +46,16 @@ typedef struct {
     Coroutine base;
     void *stack;
     size_t stack_size;
+#ifdef __e2k__
+    /*
+     * E2K has makecontext_e2k() instead of makecontext(): it allocates
+     * the hardware procedure/chain stacks in addition to the user-provided
+     * stack.  The context must stay alive for the whole coroutine lifetime
+     * so that qemu_coroutine_delete() can release the HW stacks with
+     * freecontext_e2k().
+     */
+    ucontext_t uc;
+#endif
 #ifdef CONFIG_SAFESTACK
     /* Need an unsafe stack for each coroutine */
     void *unsafe_stack;
@@ -181,6 +191,7 @@ Coroutine *qemu_coroutine_new(void)
 {
     CoroutineUContext *co;
     ucontext_t old_uc, uc;
+    ucontext_t *ucp = &uc;
     sigjmp_buf old_env;
     union cc_arg arg = {0};
     void *fake_stack_save = NULL;
@@ -193,10 +204,6 @@ Coroutine *qemu_coroutine_new(void)
      * everything else.
      */
 
-    if (getcontext(&uc) == -1) {
-        abort();
-    }
-
     co = g_malloc0(sizeof(*co));
     co->stack_size = COROUTINE_STACK_SIZE;
     co->stack = qemu_alloc_stack(&co->stack_size);
@@ -206,10 +213,18 @@ Coroutine *qemu_coroutine_new(void)
 #endif
     co->base.entry_arg = &old_env; /* stash away our jmp_buf */
 
-    uc.uc_link = &old_uc;
-    uc.uc_stack.ss_sp = co->stack;
-    uc.uc_stack.ss_size = co->stack_size;
-    uc.uc_stack.ss_flags = 0;
+#ifdef __e2k__
+    /* keep the context around for freecontext_e2k() at delete time */
+    ucp = &co->uc;
+#endif
+    if (getcontext(ucp) == -1) {
+        abort();
+    }
+
+    ucp->uc_link = &old_uc;
+    ucp->uc_stack.ss_sp = co->stack;
+    ucp->uc_stack.ss_size = co->stack_size;
+    ucp->uc_stack.ss_flags = 0;
 
 #ifdef CONFIG_VALGRIND_H
     co->valgrind_stack_id =
@@ -219,8 +234,15 @@ Coroutine *qemu_coroutine_new(void)
     arg.p = co;
 
     on_new_fiber(co);
-    makecontext(&uc, (void (*)(void))coroutine_trampoline,
+#ifdef __e2k__
+    if (makecontext_e2k(ucp, (void (*)(void))coroutine_trampoline,
+                        2, arg.i[0], arg.i[1]) < 0) {
+        abort();
+    }
+#else
+    makecontext(ucp, (void (*)(void))coroutine_trampoline,
                 2, arg.i[0], arg.i[1]);
+#endif
 
     /* swapcontext() in, siglongjmp() back out */
     if (!sigsetjmp(old_env, 0)) {
@@ -243,7 +265,7 @@ Coroutine *qemu_coroutine_new(void)
         __safestack_unsafe_stack_ptr = usp;
 #endif
 
-        swapcontext(&old_uc, &uc);
+        swapcontext(&old_uc, ucp);
     }
 
     finish_switch_fiber(fake_stack_save);
@@ -290,6 +312,11 @@ void qemu_coroutine_delete(Coroutine *co_)
 
 #ifdef CONFIG_VALGRIND_H
     valgrind_stack_deregister(co);
+#endif
+
+#ifdef __e2k__
+    /* release the HW stacks allocated by makecontext_e2k() */
+    freecontext_e2k(&co->uc);
 #endif
 
     qemu_free_stack(co->stack, co->stack_size);

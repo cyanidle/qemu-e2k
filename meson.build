@@ -503,7 +503,12 @@ ucontext_probe = '''
   #ifdef __stub_makecontext
   #error Ignoring glibc stub makecontext which will always fail
   #endif
-  int main(void) { makecontext(0, 0, 0); return 0; }'''
+  #ifdef __e2k__
+  /* E2K glibc provides makecontext_e2k() instead of makecontext() */
+  int main(void) { makecontext_e2k(0, 0, 0); return 0; }
+  #else
+  int main(void) { makecontext(0, 0, 0); return 0; }
+  #endif'''
 
 # On Windows the only valid backend is the Windows specific one.
 # For POSIX prefer ucontext, but it's not always possible. The fallback

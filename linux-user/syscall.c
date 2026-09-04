@@ -14301,6 +14301,14 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         /* PowerPC specific.  */
         return do_swapcontext(cpu_env, arg1, arg2, arg3);
 #endif
+#ifdef TARGET_E2K
+    case TARGET_NR_setcontext:
+        return do_setcontext(cpu_env, arg1, arg2);
+    case TARGET_NR_makecontext:
+        return do_makecontext(cpu_env, arg1, arg2, arg3, arg4, arg5);
+    case TARGET_NR_freecontext:
+        return do_freecontext(cpu_env, arg1);
+#endif
 #ifdef TARGET_NR_memfd_create
     case TARGET_NR_memfd_create:
         p = lock_user_string(arg1);

@@ -1,14 +1,11 @@
 /*
- * Minimal coroutine demo using ucontext on E2K.
+ * E2K ucontext syscall regression test.
  *
  * E2K quirk: plain makecontext() does not exist. glibc provides
  * makecontext_e2k() instead, which additionally allocates the hardware
  * procedure/chain stacks (and can therefore fail), and freecontext_e2k()
  * to release them. The ucontext_t must stay alive for the whole lifetime
  * of the coroutine.
- *
- * Cross-compile with:
- *   /opt/mcst/lcc-1.29.16.e2k-v4.linux-6.1/bin/lcc -O2 -static -o coroutine-e2k-demo coroutine-e2k-demo.c -lm
  */
 #include <errno.h>
 #include <fenv.h>
@@ -25,7 +22,8 @@
 #define CO_STACK_SIZE (64 * 1024)
 
 static ucontext_t main_ctx;
-static ucontext_t co_ctx;   /* must outlive the coroutine: freecontext_e2k() needs it */
+/* Must outlive the coroutine because freecontext_e2k() needs it. */
+static ucontext_t co_ctx;
 static void *co_stack;
 
 static void coroutine_body(void)
@@ -104,22 +102,14 @@ static void test_arguments(void)
     co_ctx.uc_stack.ss_sp = co_stack;
     co_ctx.uc_stack.ss_size = CO_STACK_SIZE;
     co_ctx.uc_link = NULL;
-#ifdef __e2k__
     check(makecontext_e2k(&co_ctx, (void (*)(void))argument_body, 10,
                          11L, 22L, 33L, 44L, 55L, 66L, 77L, 88L, 99L, 110L)
           == 0, "make ten-argument context");
     /* The e2k trampoline must follow the live link, not a cached pointer. */
     co_ctx.uc_link = &main_ctx;
-#else
-    co_ctx.uc_link = &main_ctx;
-    makecontext(&co_ctx, (void (*)(void))argument_body, 10,
-                11L, 22L, 33L, 44L, 55L, 66L, 77L, 88L, 99L, 110L);
-#endif
     check(swapcontext(&main_ctx, &co_ctx) == 0, "run argument context");
     check(args_seen == 1, "argument function ran");
-#ifdef __e2k__
     check(freecontext_e2k(&co_ctx) == 0, "free argument context");
-#endif
     puts("PASS: ten arguments and uc_link");
 }
 
@@ -137,10 +127,8 @@ static void check_rounding(int mode)
 
 static void fpu_body(void)
 {
-#ifdef __e2k__
     /* Unlike other ABIs, makecontext_e2k installs default FPU state. */
     check_rounding(FE_TONEAREST);
-#endif
     check(fesetround(FE_DOWNWARD) == 0, "coroutine rounding mode");
     check(feclearexcept(FE_ALL_EXCEPT) == 0, "clear coroutine exceptions");
     check(feraiseexcept(FE_INVALID) == 0, "raise coroutine exception");
@@ -171,11 +159,7 @@ static void test_fpu(void)
     co_ctx.uc_stack.ss_sp = co_stack;
     co_ctx.uc_stack.ss_size = CO_STACK_SIZE;
     co_ctx.uc_link = &main_ctx;
-#ifdef __e2k__
     check(makecontext_e2k(&co_ctx, fpu_body, 0) == 0, "make FPU context");
-#else
-    makecontext(&co_ctx, fpu_body, 0);
-#endif
     check(feclearexcept(FE_ALL_EXCEPT) == 0, "clear main exceptions");
     check(feraiseexcept(FE_DIVBYZERO) == 0, "raise main exception");
     for (int i = 0; i < 101; i++) {
@@ -184,9 +168,7 @@ static void test_fpu(void)
               "main FPU exception flags");
         check_rounding(FE_UPWARD);
     }
-#ifdef __e2k__
     check(freecontext_e2k(&co_ctx) == 0, "free FPU context");
-#endif
     check(fesetenv(&original) == 0, "restore FPU environment");
     puts("PASS: FPU rounding, arithmetic and exception flags");
 }
@@ -196,7 +178,6 @@ static void null_link_body(void)
     puts("PASS: null-link body");
 }
 
-#ifdef __e2k__
 static void test_boundaries(void)
 {
     size_t page = sysconf(_SC_PAGESIZE);
@@ -239,7 +220,6 @@ static void test_boundaries(void)
     check(munmap(mapping, 2 * page) == 0, "unmap context buffer");
     puts("PASS: context buffer boundaries and errors");
 }
-#endif
 
 static void test_null_link(void)
 {
@@ -252,12 +232,8 @@ static void test_null_link(void)
         co_ctx.uc_stack.ss_sp = co_stack;
         co_ctx.uc_stack.ss_size = CO_STACK_SIZE;
         co_ctx.uc_link = NULL;
-#ifdef __e2k__
         check(makecontext_e2k(&co_ctx, null_link_body, 0) == 0,
               "make null-link context");
-#else
-        makecontext(&co_ctx, null_link_body, 0);
-#endif
         setcontext(&co_ctx);
         _exit(42);
     }
@@ -285,15 +261,11 @@ int main(void)
     co_ctx.uc_stack.ss_size = CO_STACK_SIZE;
     co_ctx.uc_stack.ss_flags = 0;
 
-#ifdef __e2k__
     /* E2K: allocates HW stacks, may fail, returns int instead of void */
     if (makecontext_e2k(&co_ctx, coroutine_body, 0) < 0) {
         fprintf(stderr, "makecontext_e2k failed\n");
         return 1;
     }
-#else
-    makecontext(&co_ctx, coroutine_body, 0);
-#endif
 
     for (int i = 0; i < 4; i++) {
         printf("main: resume %d\n", i);
@@ -304,18 +276,14 @@ int main(void)
     }
     printf("main: done\n");
 
-#ifdef __e2k__
     /* E2K: release the HW stacks allocated by makecontext_e2k() */
     if (freecontext_e2k(&co_ctx) < 0) {
         fprintf(stderr, "freecontext_e2k failed\n");
         return 1;
     }
-#endif
     test_arguments();
     test_fpu();
-#ifdef __e2k__
     test_boundaries();
-#endif
     test_null_link();
     free(co_stack);
     puts("PASS: all coroutine tests");

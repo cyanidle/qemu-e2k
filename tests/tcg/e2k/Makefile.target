@@ -24,12 +24,20 @@ TESTS = $(MULTIARCH_TESTS) $(E2K_ALL_TESTS)
 test-int: test-int.o common.o
 test-fp: test-fp.o common.o
 test-vec: test-vec.o common.o
+test-ucontext: test-ucontext.o
+	$(CC) $(LDFLAGS) -o $@ $^ -lm
 
 deps: $(E2K_SRCS)
 	@$(CC) $(CFLAGS) -MM $^ > $@
 include deps
 
 run-test-int run-test-fp run-test-vec: QEMU_OPTS += -cpu elbrus-v7
+run-test-ucontext: QEMU_OPTS += -cpu elbrus-v4
+
+run-test-ucontext-tags: test-ucontext
+	$(call run-test, $@, env QEMU=$(QEMU) $(QEMU) \
+		-cpu elbrus-v4$(COMMA)tags=on $<, ucontext with tags)
+EXTRA_RUNS += run-test-ucontext-tags
 
 %.o: %.s
 	$(CC) -c $(CFLAGS) -o $@ $<

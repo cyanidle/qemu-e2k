@@ -69,6 +69,18 @@ abi_long do_sigaltstack(abi_ulong uss_addr, abi_ulong uoss_addr,
 int do_sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 abi_long do_swapcontext(CPUArchState *env, abi_ulong uold_ctx,
                         abi_ulong unew_ctx, abi_long ctx_size);
+#ifdef TARGET_E2K
+abi_long do_setcontext(CPUArchState *env, abi_ulong ucp,
+                       abi_long sigsetsize);
+abi_long do_makecontext(CPUArchState *env, abi_ulong ucp, abi_ulong helper,
+                        abi_ulong args_size, abi_ulong args,
+                        abi_long sigsetsize);
+abi_long do_freecontext(CPUArchState *env, abi_ulong ucp);
+abi_long do_fast_getcontext(CPUArchState *env, abi_ulong ucp,
+                            abi_long sigsetsize);
+abi_long do_fast_siggetmask(CPUArchState *env, abi_ulong oset,
+                            abi_long sigsetsize);
+#endif
 /**
  * block_signals: block all signals while handling this guest syscall
  *

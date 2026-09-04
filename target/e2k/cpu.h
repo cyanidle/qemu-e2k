@@ -93,6 +93,7 @@ typedef enum {
 typedef enum {
     CTPR_OPC_DISP = 0x0,
     CTPR_OPC_LDISP = 0x1,
+    CTPR_OPC_CTXRET = 0x2,
     CTPR_OPC_SIGRET = 0x3,
 } CtprOpc;
 
@@ -127,6 +128,10 @@ typedef enum {
 # define E2K_SYSRET_ADDR (E2K_FAKE_KERN_START + 0x15700)
 # define E2K_SIGRET_ADDR (E2K_FAKE_KERN_START + 0x15800)
 # define E2K_SYSRET_BACKTRACE_ADDR (E2K_FAKE_KERN_START + 0x15900)
+/* Fake address a makecontext'd coroutine "returns" to when its function
+ * and the makecontext trampoline are done: raises a setcontext(uc_link)
+ * syscall. */
+# define E2K_CTXRET_ADDR (E2K_FAKE_KERN_START + 0x15a00)
 #endif /* CONFIG_USER_ONLY */
 
 #define WD_BASE_OFF 0

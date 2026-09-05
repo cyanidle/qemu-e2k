@@ -389,7 +389,7 @@ typedef struct E2KCoroContext {
     uint32_t ilcr;
     uint64_t ilcr_lcnt;
     bool allocated;         /* PS/PCS were allocated by makecontext */
-    bool in_use;            /* a CPU is currently executing this context */
+    TaskState *owner;       /* guest thread currently executing this context */
     bool fresh;
     QTAILQ_ENTRY(E2KCoroContext) entry;
 } E2KCoroContext;
@@ -429,8 +429,23 @@ static void coro_munmap_stacks(E2KPsp *psp, E2KPsp *pcsp)
     }
 }
 
+static bool coro_clear_user(abi_ulong addr, size_t size)
+{
+    void *p = lock_user(VERIFY_WRITE, addr, size, 0);
+
+    if (!p) {
+        return false;
+    }
+    memset(p, 0, size);
+    unlock_user(p, addr, size);
+    return true;
+}
+
 static void coro_free(E2KCoroContext *ctx)
 {
+    if (ctx->owner) {
+        ctx->owner->e2k_coro_current = NULL;
+    }
     if (ctx->allocated) {
         coro_munmap_stacks(&ctx->psp, &ctx->pcsp);
     }
@@ -538,19 +553,78 @@ static abi_long coro_fill_ucp(CPUE2KState *env, abi_ulong ucp_addr,
 }
 
 /* Record the current context in the registry, creating an entry if needed */
-static E2KCoroContext *coro_save_current(CPUE2KState *env)
+static abi_long coro_save_current(CPUE2KState *env, E2KCoroContext **ctxp)
 {
-    E2KCoroContext *ctx = coro_lookup(env->sbr);
+    TaskState *ts = get_task_state(env_cpu(env));
+    E2KCoroContext *ctx = ts->e2k_coro_current;
 
     if (!ctx) {
-        ctx = g_new0(E2KCoroContext, 1);
-        ctx->key = env->sbr;
-        ctx->allocated = false;
-        ctx->in_use = true;
-        QTAILQ_INSERT_TAIL(&coro_ctxs, ctx, entry);
+        ctx = coro_lookup(env->sbr);
+        if (ctx) {
+            if (ctx->owner) {
+                return -TARGET_EBUSY;
+            }
+        } else {
+            ctx = g_try_new0(E2KCoroContext, 1);
+            if (!ctx) {
+                return -TARGET_ENOMEM;
+            }
+            ctx->key = env->sbr;
+            ctx->allocated = false;
+            QTAILQ_INSERT_TAIL(&coro_ctxs, ctx, entry);
+        }
+        ctx->owner = ts;
+        ts->e2k_coro_current = ctx;
     }
     coro_save_env(env, ctx);
-    return ctx;
+    *ctxp = ctx;
+    return 0;
+}
+
+void e2k_coro_fork_start(void)
+{
+    CPUState *cpu;
+
+    qemu_mutex_lock(&coro_ctxs_lock);
+    CPU_FOREACH(cpu) {
+        TaskState *ts = get_task_state(cpu);
+
+        if (ts->e2k_coro_current) {
+            coro_save_env(cpu_env(cpu), ts->e2k_coro_current);
+        }
+    }
+}
+
+void e2k_coro_fork_end(bool child)
+{
+    if (child) {
+        TaskState *ts = get_task_state(thread_cpu);
+        E2KCoroContext *ctx, *next;
+
+        QTAILQ_FOREACH_SAFE(ctx, &coro_ctxs, entry, next) {
+            if (ctx->owner && ctx->owner != ts) {
+                coro_free(ctx);
+            }
+        }
+        qemu_mutex_init(&coro_ctxs_lock);
+    } else {
+        qemu_mutex_unlock(&coro_ctxs_lock);
+    }
+}
+
+void e2k_coro_thread_exit(CPUE2KState *env)
+{
+    TaskState *ts = get_task_state(env_cpu(env));
+    E2KCoroContext *ctx;
+
+    qemu_mutex_lock(&coro_ctxs_lock);
+    ctx = ts->e2k_coro_current;
+    if (ctx) {
+        coro_save_env(env, ctx);
+        ts->e2k_coro_current = NULL;
+        coro_free(ctx);
+    }
+    qemu_mutex_unlock(&coro_ctxs_lock);
 }
 
 static abi_long coro_switch_to(CPUE2KState *env, abi_ulong ucp_addr)
@@ -589,13 +663,16 @@ static abi_long coro_switch_to(CPUE2KState *env, abi_ulong ucp_addr)
     }
 
     qemu_mutex_lock(&coro_ctxs_lock);
-    old = coro_save_current(env);
+    ret = coro_save_current(env, &old);
+    if (ret) {
+        goto out;
+    }
     ctx = coro_lookup(key);
     if (!ctx) {
         ret = -TARGET_ESRCH;
         goto out;
     }
-    if (ctx->in_use && ctx != old) {
+    if (ctx->owner && ctx != old) {
         ret = -TARGET_EBUSY;
         goto out;
     }
@@ -641,8 +718,9 @@ static abi_long coro_switch_to(CPUE2KState *env, abi_ulong ucp_addr)
             goto out;
         }
     }
-    old->in_use = false;
-    ctx->in_use = true;
+    old->owner = NULL;
+    ctx->owner = get_task_state(env_cpu(env));
+    ctx->owner->e2k_coro_current = ctx;
     ctx->fresh = false;
     coro_restore_env(env, ctx);
     qemu_mutex_unlock(&coro_ctxs_lock);
@@ -674,21 +752,11 @@ out:
 abi_long do_fast_getcontext(CPUArchState *env, abi_ulong ucp_addr,
                             abi_long sigsetsize)
 {
-    abi_long ret;
-
     if (sigsetsize != 8) {
         return -TARGET_EINVAL;
     }
 
-    ret = coro_fill_ucp(env, ucp_addr, false);
-    if (ret) {
-        return ret;
-    }
-
-    qemu_mutex_lock(&coro_ctxs_lock);
-    coro_save_current(env);
-    qemu_mutex_unlock(&coro_ctxs_lock);
-    return 0;
+    return coro_fill_ucp(env, ucp_addr, false);
 }
 
 abi_long do_fast_siggetmask(CPUArchState *env, abi_ulong oset_addr,
@@ -724,6 +792,7 @@ abi_long do_setcontext(CPUArchState *env, abi_ulong ucp_addr,
 abi_long do_swapcontext(CPUArchState *env, abi_ulong oucp_addr,
                         abi_ulong ucp_addr, abi_long sigsetsize)
 {
+    E2KCoroContext *old;
     abi_long ret;
 
     if (sigsetsize != 8) {
@@ -732,6 +801,12 @@ abi_long do_swapcontext(CPUArchState *env, abi_ulong oucp_addr,
 
     if (!oucp_addr || !ucp_addr) {
         return -TARGET_EFAULT;
+    }
+    qemu_mutex_lock(&coro_ctxs_lock);
+    ret = coro_save_current(env, &old);
+    qemu_mutex_unlock(&coro_ctxs_lock);
+    if (ret) {
+        return ret;
     }
     ret = coro_fill_ucp(env, oucp_addr, true);
     if (ret) {
@@ -763,6 +838,7 @@ abi_long do_makecontext(CPUArchState *env, abi_ulong ucp_addr,
     abi_ullong stk_size, top, func_frame_size, func_frame_ptr;
     abi_ullong key;
     abi_long ret = 0;
+    bool reused = false;
     int i, nreg_args;
 
     if (sigsetsize != 8) {
@@ -809,46 +885,61 @@ abi_long do_makecontext(CPUArchState *env, abi_ulong ucp_addr,
     qemu_mutex_lock(&coro_ctxs_lock);
     ctx = coro_lookup(key);
     if (ctx) {
-        if (ctx->in_use) {
+        if (ctx->owner) {
             qemu_mutex_unlock(&coro_ctxs_lock);
             ret = -TARGET_EBUSY;
             goto out;
         }
-        /* silently drop the previous context on this stack */
-        coro_free(ctx);
+        psp = ctx->psp;
+        pcsp = ctx->pcsp;
+        psp.index = 0;
+        pcsp.index = 0;
+        reused = true;
+        memset(ctx->regs, 0, sizeof(ctx->regs));
+        memset(ctx->tags, 0, sizeof(ctx->tags));
+        ctx->lsr = 0;
+        ctx->lsr_lcnt = 0;
+        ctx->ilcr = 0;
+        ctx->ilcr_lcnt = 0;
+        if (!coro_clear_user(psp.base, 2 * E2K_UCTX_PS_FRAME) ||
+            !coro_clear_user(psp.base_tag,
+                             2 * E2K_UCTX_PS_FRAME / 8) ||
+            !coro_clear_user(pcsp.base, 4 * sizeof(E2KCrs))) {
+            goto fail;
+        }
+    } else {
+        ctx = g_try_new0(E2KCoroContext, 1);
+        if (!ctx) {
+            ret = -TARGET_ENOMEM;
+            goto fail;
+        }
+        addr = target_mmap(0, E2K_DEFAULT_PS_SIZE, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (addr == -1) {
+            ret = -TARGET_ENOMEM;
+            goto fail;
+        }
+        e2k_psp_new(&psp, E2K_DEFAULT_PS_SIZE, addr, 0);
+        addr = target_mmap(0, QEMU_ALIGN_UP(E2K_DEFAULT_PS_SIZE / 8,
+                                           TARGET_PAGE_SIZE),
+                           PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (addr == -1) {
+            ret = -TARGET_ENOMEM;
+            goto fail;
+        }
+        psp.base_tag = addr;
+        addr = target_mmap(0, E2K_DEFAULT_PCS_SIZE, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (addr == -1) {
+            ret = -TARGET_ENOMEM;
+            goto fail;
+        }
+        e2k_psp_new(&pcsp, E2K_DEFAULT_PCS_SIZE, addr, 0);
     }
 
-    ctx = g_try_new0(E2KCoroContext, 1);
-    if (!ctx) {
-        ret = -TARGET_ENOMEM;
-        goto fail;
-    }
-    addr = target_mmap(0, E2K_DEFAULT_PS_SIZE, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (addr == -1) {
-        ret = -TARGET_ENOMEM;
-        goto fail;
-    }
-    e2k_psp_new(&psp, E2K_DEFAULT_PS_SIZE, addr, 0);
-    addr = target_mmap(0, QEMU_ALIGN_UP(E2K_DEFAULT_PS_SIZE / 8,
-                                       TARGET_PAGE_SIZE),
-                       PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (addr == -1) {
-        ret = -TARGET_ENOMEM;
-        goto fail;
-    }
-    psp.base_tag = addr;
-    addr = target_mmap(0, E2K_DEFAULT_PCS_SIZE, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (addr == -1) {
-        ret = -TARGET_ENOMEM;
-        goto fail;
-    }
-    e2k_psp_new(&pcsp, E2K_DEFAULT_PCS_SIZE, addr, 0);
-
-    /* fresh anonymous mappings are zero-filled: frame records at [0..64)
-     * and the register spill area at [0..128) stay zero */
+    /* Frame records at [0..64) and the spill area at [0..128) are zero for
+     * both fresh mappings and contexts reset through the reuse path. */
 
     /* chain stack: trampoline frame at [64], helper frame at [96] */
     memset(&crs, 0, sizeof(crs));
@@ -957,16 +1048,22 @@ abi_long do_makecontext(CPUArchState *env, abi_ulong ucp_addr,
     ctx->cuir = 0;
     ctx->upsr = env->upsr;
     ctx->allocated = true;
-    ctx->in_use = false;
+    ctx->owner = NULL;
     ctx->fresh = true;
-    QTAILQ_INSERT_TAIL(&coro_ctxs, ctx, entry);
+    if (!reused) {
+        QTAILQ_INSERT_TAIL(&coro_ctxs, ctx, entry);
+    }
     qemu_mutex_unlock(&coro_ctxs_lock);
     goto out;
 
 fail:
-    coro_munmap_stacks(&psp, &pcsp);
+    if (reused) {
+        coro_free(ctx);
+    } else {
+        coro_munmap_stacks(&psp, &pcsp);
+        g_free(ctx);
+    }
     qemu_mutex_unlock(&coro_ctxs_lock);
-    g_free(ctx);
     ret = ret ? ret : -TARGET_EFAULT;
 out:
     unlock_user(ucp, ucp_addr, ret == 0 ? E2K_UCONTEXT_SIZE : 0);
@@ -989,7 +1086,7 @@ abi_long do_freecontext(CPUArchState *env, abi_ulong ucp_addr)
         qemu_mutex_unlock(&coro_ctxs_lock);
         return -TARGET_ENOENT;
     }
-    if (ctx->in_use) {
+    if (ctx->owner) {
         qemu_mutex_unlock(&coro_ctxs_lock);
         return -TARGET_EBUSY;
     }

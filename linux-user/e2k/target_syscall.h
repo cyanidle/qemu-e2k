@@ -9,7 +9,7 @@
 #define UNAME_MINIMUM_RELEASE "2.6.32"
 
 #define E2K_DEFAULT_PCS_SIZE (TARGET_PAGE_SIZE)
-#define E2K_DEFAULT_PS_SIZE (TARGET_PAGE_SIZE)
+#define E2K_DEFAULT_PS_SIZE (4 * TARGET_PAGE_SIZE)
 
 typedef uint64_t e2k_greg_t; // double word
 

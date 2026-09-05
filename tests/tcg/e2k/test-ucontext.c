@@ -9,12 +9,15 @@
  */
 #include <errno.h>
 #include <fenv.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <ucontext.h>
@@ -173,6 +176,175 @@ static void test_fpu(void)
     puts("PASS: FPU rounding, arithmetic and exception flags");
 }
 
+static ucontext_t restart_ctx;
+static int restart_old_resumed;
+static int restart_runs;
+
+static void restart_old_body(long value)
+{
+    restart_runs = value;
+    check(swapcontext(&restart_ctx, &main_ctx) == 0, "restart yield");
+    restart_old_resumed = 1;
+}
+
+static void restart_new_body(long value)
+{
+    restart_runs += value;
+}
+
+static void test_restart(void)
+{
+    check(getcontext(&restart_ctx) == 0, "restart context");
+    restart_ctx.uc_stack.ss_sp = co_stack;
+    restart_ctx.uc_stack.ss_size = CO_STACK_SIZE;
+    restart_ctx.uc_link = &main_ctx;
+    check(makecontext_e2k(&restart_ctx, (void (*)(void))restart_old_body, 1,
+                          1L) == 0, "make suspended context");
+    check(swapcontext(&main_ctx, &restart_ctx) == 0, "run suspended context");
+    check(restart_runs == 1, "suspended context ran");
+
+    check(makecontext_e2k(&restart_ctx, (void (*)(void))restart_new_body, 1,
+                          10L) == 0, "remake suspended context");
+    check(swapcontext(&main_ctx, &restart_ctx) == 0, "run remade context");
+    check(restart_runs == 11 && !restart_old_resumed,
+          "suspended continuation discarded");
+
+    check(makecontext_e2k(&restart_ctx, (void (*)(void))restart_new_body, 1,
+                          20L) == 0, "remake completed context");
+    check(swapcontext(&main_ctx, &restart_ctx) == 0,
+          "rerun completed context");
+    check(restart_runs == 31, "completed context restarted");
+    check(freecontext_e2k(&restart_ctx) == 0, "free restarted context");
+    puts("PASS: suspended and completed context remake");
+}
+
+static ucontext_t deep_ctx;
+static int deep_yields;
+static unsigned long deep_result;
+
+static __attribute__((noinline)) unsigned long
+deep_recurse(int depth, unsigned long seed)
+{
+    volatile unsigned long keep = seed ^ (unsigned long)depth ^ 0xa5a5a5a5UL;
+    unsigned long result;
+
+    if (depth == 0) {
+        for (int i = 0; i < 8; i++) {
+            deep_yields++;
+            check(swapcontext(&deep_ctx, &main_ctx) == 0, "deep-stack yield");
+        }
+        result = seed;
+    } else {
+        result = deep_recurse(depth - 1, seed + 0x101UL);
+    }
+    check(keep == (seed ^ (unsigned long)depth ^ 0xa5a5a5a5UL),
+          "deep data stack preserved");
+    return result ^ seed ^ (unsigned long)depth;
+}
+
+static void deep_body(void)
+{
+    deep_result = deep_recurse(320, 0x12345678UL);
+}
+
+static void test_deep_stacks(void)
+{
+    check(getcontext(&deep_ctx) == 0, "deep-stack context");
+    deep_ctx.uc_stack.ss_sp = co_stack;
+    deep_ctx.uc_stack.ss_size = CO_STACK_SIZE;
+    deep_ctx.uc_link = &main_ctx;
+    check(makecontext_e2k(&deep_ctx, deep_body, 0) == 0,
+          "make deep-stack context");
+    for (int i = 0; i < 9; i++) {
+        check(swapcontext(&main_ctx, &deep_ctx) == 0, "resume deep stack");
+    }
+    check(deep_yields == 8 && deep_result != 0, "deep context completed");
+    check(freecontext_e2k(&deep_ctx) == 0, "free deep-stack context");
+    puts("PASS: expanded procedure and chain stacks");
+}
+
+static ucontext_t thread_ctx;
+static void *thread_stack;
+static int thread_ready;
+static int thread_stop;
+
+static __attribute__((noinline)) void thread_exit_deep(int depth)
+{
+    volatile unsigned long keep = 0xfeed0000UL + (unsigned long)depth;
+
+    if (depth) {
+        thread_exit_deep(depth - 1);
+        check(keep == 0, "thread exit must not return");
+    } else {
+        __atomic_store_n(&thread_ready, 1, __ATOMIC_RELEASE);
+        while (!__atomic_load_n(&thread_stop, __ATOMIC_ACQUIRE)) {
+            sched_yield();
+        }
+        syscall(SYS_exit, 0);
+        abort();
+    }
+}
+
+static void thread_context_body(void)
+{
+    thread_exit_deep(320);
+}
+
+static void *thread_start(void *unused)
+{
+    (void)unused;
+    if (setcontext(&thread_ctx) < 0) {
+        return (void *)1;
+    }
+    return (void *)2;
+}
+
+static void test_thread_fork_lifecycle(void)
+{
+    pthread_t thread;
+    void *retval;
+    pid_t pid;
+    int status;
+
+    thread_stack = malloc(CO_STACK_SIZE);
+    check(thread_stack != NULL, "allocate thread context stack");
+    check(getcontext(&thread_ctx) == 0, "thread context");
+    thread_ctx.uc_stack.ss_sp = thread_stack;
+    thread_ctx.uc_stack.ss_size = CO_STACK_SIZE;
+    thread_ctx.uc_link = NULL;
+    check(makecontext_e2k(&thread_ctx, thread_context_body, 0) == 0,
+          "make thread context");
+    check(pthread_create(&thread, NULL, thread_start, NULL) == 0,
+          "create context thread");
+    while (!__atomic_load_n(&thread_ready, __ATOMIC_ACQUIRE)) {
+        sched_yield();
+    }
+
+    errno = 0;
+    check(freecontext_e2k(&thread_ctx) == -1 && errno == EBUSY,
+          "active foreign context is busy");
+    pid = fork();
+    check(pid >= 0, "fork with active context");
+    if (pid == 0) {
+        errno = 0;
+        check(freecontext_e2k(&thread_ctx) == -1 && errno == ENOENT,
+              "foreign active context omitted after fork");
+        _exit(0);
+    }
+    check(waitpid(pid, &status, 0) == pid, "wait lifecycle child");
+    check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "forked context registry");
+
+    __atomic_store_n(&thread_stop, 1, __ATOMIC_RELEASE);
+    check(pthread_join(thread, &retval) == 0 && retval == NULL,
+          "join context thread");
+    errno = 0;
+    check(freecontext_e2k(&thread_ctx) == -1 && errno == ENOENT,
+          "thread exit released active context");
+    free(thread_stack);
+    puts("PASS: thread exit and fork lifecycle");
+}
+
 static void null_link_body(void)
 {
     puts("PASS: null-link body");
@@ -283,8 +455,11 @@ int main(void)
     }
     test_arguments();
     test_fpu();
+    test_restart();
+    test_deep_stacks();
     test_boundaries();
     test_null_link();
+    test_thread_fork_lifecycle();
     free(co_stack);
     puts("PASS: all coroutine tests");
     return 0;

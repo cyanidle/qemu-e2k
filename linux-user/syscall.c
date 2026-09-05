@@ -9730,6 +9730,9 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
                              FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
             }
 
+#ifdef TARGET_E2K
+            e2k_coro_thread_exit(cpu_env);
+#endif
             object_unparent(OBJECT(cpu));
             object_unref(OBJECT(cpu));
             /*

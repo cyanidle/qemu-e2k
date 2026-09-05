@@ -98,6 +98,9 @@ struct emulated_sigtable {
 
 struct TaskState {
     pid_t ts_tid;     /* tid (or pid) of this task */
+#ifdef TARGET_E2K
+    struct E2KCoroContext *e2k_coro_current;
+#endif
 #ifdef TARGET_ARM
 # ifdef TARGET_ABI32
     /* FPA state */
@@ -164,6 +167,12 @@ struct TaskState {
     /* Start time of task after system boot in clock ticks */
     uint64_t start_boottime;
 };
+
+#ifdef TARGET_E2K
+void e2k_coro_fork_start(void);
+void e2k_coro_fork_end(bool child);
+void e2k_coro_thread_exit(CPUArchState *env);
+#endif
 
 abi_long do_brk(abi_ulong new_brk);
 int do_guest_openat(CPUArchState *cpu_env, int dirfd, const char *pathname,

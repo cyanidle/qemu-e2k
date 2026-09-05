@@ -144,6 +144,9 @@ unsigned long guest_stack_size = TARGET_DEFAULT_STACK_SIZE;
 void fork_start(void)
 {
     start_exclusive();
+#ifdef TARGET_E2K
+    e2k_coro_fork_start();
+#endif
     mmap_fork_start();
     cpu_list_lock();
     qemu_plugin_user_prefork_lock();
@@ -156,6 +159,9 @@ void fork_end(pid_t pid)
 
     qemu_plugin_user_postfork(child);
     mmap_fork_end(child);
+#ifdef TARGET_E2K
+    e2k_coro_fork_end(child);
+#endif
     if (child) {
         CPUState *cpu, *next_cpu;
         /* Child processes created by fork() only have a single thread.

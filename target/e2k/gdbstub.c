@@ -28,7 +28,7 @@ static int e2k_gdb_get_reg(CPUState *cs, GByteArray *mem_buf, int n)
     CPUE2KState *env = &cpu->env;
 
     switch (n) {
-    case 0: return gdb_get_reg64(mem_buf, 0); // unk
+    case 0: return gdb_get_reg64(mem_buf, 0x12b0); // _sizeof: e2k core gregset marker
     case 1: return gdb_get_reg64(mem_buf, 0); // b0
     case 2: return gdb_get_reg64(mem_buf, 0); // b1
     default: break;
@@ -335,19 +335,25 @@ void e2k_cpu_register_gdb_regs_for_features(CPUState *cs)
     E2KCPU *cpu = E2K_CPU(cs);
     CPUE2KState *env = &cpu->env;
 
+    /* Local debug build: e2k-linux-gdb 29.020 expects the wire 'g' packet to
+     * cover exactly the 574 core registers (4588 bytes).  Extending 'g' past
+     * that makes GDB abort the session ("Remote 'g' packet reply is too
+     * long").  Pass g_pos 0 so the extension features stay reachable via
+     * 'p' packets but never become part of 'g'. */
+
     if (env->def.isa >= 2) {
         gdb_register_coprocessor(cs, e2k_gdb_get_reg, e2k_gdb_set_reg,
-                                 gdb_find_static_feature("e2k-v2.xml"), 574);
+                                 gdb_find_static_feature("e2k-v2.xml"), 0);
     }
 
     if (env->def.isa >= 3) {
         gdb_register_coprocessor(cs, e2k_gdb_get_reg, e2k_gdb_set_reg,
-                                 gdb_find_static_feature("e2k-v3.xml"), 575);
+                                 gdb_find_static_feature("e2k-v3.xml"), 0);
     }
 
     if (env->def.isa >= 5) {
         gdb_register_coprocessor(cs, e2k_gdb_get_reg, e2k_gdb_set_reg,
-                                 gdb_find_static_feature("e2k-v5.xml"), 576);
+                                 gdb_find_static_feature("e2k-v5.xml"), 0);
     }
 
     if (env->def.isa >= 3) {
